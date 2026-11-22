@@ -1,0 +1,7 @@
+# name value hex  (encoded with the reference pr705_pb2; last line is a full v0x13 packet)
+cfg_max_chg_soc 85 880255
+cfg_min_dsg_soc 15 90020f
+cfg_led_mode 2 c80502
+cfg_dc_12v_out_open 1 900101
+cfg_ac_out_open 0 e00400
+packet cfg_min_dsg_soc 15 aa130300430d00000000000020020101fe1190020fb1fd

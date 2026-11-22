@@ -119,6 +119,41 @@ impl LedMode {
     pub fn is_on(self) -> bool {
         !matches!(self, Self::Off)
     }
+
+    /// Wire value sent to the device.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Dim => 1,
+            Self::Bright => 2,
+            Self::Sos => 3,
+            Self::Unknown(n) => n,
+        }
+    }
+
+    /// Next mode in the cycle off -> dim -> bright -> sos -> off (unknown modes restart at off).
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Dim,
+            Self::Dim => Self::Bright,
+            Self::Bright => Self::Sos,
+            Self::Sos | Self::Unknown(_) => Self::Off,
+        }
+    }
+}
+
+impl std::str::FromStr for LedMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "dim" => Ok(Self::Dim),
+            "bright" => Ok(Self::Bright),
+            "sos" => Ok(Self::Sos),
+            other => Err(format!("invalid light mode '{other}' (use off, dim, bright or sos)")),
+        }
+    }
 }
 
 impl std::fmt::Display for LedMode {

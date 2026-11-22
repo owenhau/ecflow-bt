@@ -60,3 +60,54 @@ pub struct SysUtcSync {
     #[prost(uint32, optional, tag = "1")]
     pub sys_utc_time: Option<u32>,
 }
+
+/// Subset of `ConfigWrite` (pr705.proto): the settings this tool can change.
+/// Field numbers come from the reference `pr705_pb2` descriptor; unset fields are not
+/// encoded, so a write changes exactly one setting.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ConfigWrite {
+    #[prost(bool, optional, tag = "18")]
+    pub cfg_dc_12v_out_open: Option<bool>,
+    #[prost(uint32, optional, tag = "33")]
+    pub cfg_max_chg_soc: Option<u32>,
+    #[prost(uint32, optional, tag = "34")]
+    pub cfg_min_dsg_soc: Option<u32>,
+    #[prost(bool, optional, tag = "76")]
+    pub cfg_ac_out_open: Option<bool>,
+    #[prost(uint32, optional, tag = "89")]
+    pub cfg_led_mode: Option<u32>,
+}
+
+impl ConfigWrite {
+    /// `max_chg_soc=85 led_mode=2`-style summary of the fields that are set.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(v) = self.cfg_max_chg_soc {
+            parts.push(format!("max_chg_soc={v}"));
+        }
+        if let Some(v) = self.cfg_min_dsg_soc {
+            parts.push(format!("min_dsg_soc={v}"));
+        }
+        if let Some(v) = self.cfg_led_mode {
+            parts.push(format!("led_mode={v}"));
+        }
+        if let Some(v) = self.cfg_dc_12v_out_open {
+            parts.push(format!("dc_12v_out_open={v}"));
+        }
+        if let Some(v) = self.cfg_ac_out_open {
+            parts.push(format!("ac_out_open={v}"));
+        }
+        if parts.is_empty() {
+            "(no known fields set)".into()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+/// Packet addressing for configuration writes (as used by the reference implementation).
+pub const CONFIG_WRITE_SRC: u8 = 0x20;
+pub const CONFIG_WRITE_DST: u8 = 0x02;
+pub const CONFIG_WRITE_CMD_SET: u8 = 0xFE;
+pub const CONFIG_WRITE_CMD_ID: u8 = 0x11;
+pub const CONFIG_WRITE_PACKET_VERSION: u8 = 0x13;

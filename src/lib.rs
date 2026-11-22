@@ -1,4 +1,5 @@
 pub mod ble;
+pub mod cli;
 pub mod config;
 pub mod device;
 pub mod flow;
@@ -6,6 +7,7 @@ pub mod output;
 pub mod pb;
 pub mod protocol;
 pub mod session;
+pub mod setting;
 pub mod status;
 #[cfg(test)]
 mod testutil;

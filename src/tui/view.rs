@@ -1,18 +1,21 @@
 //! Pure rendering: `ViewState` + clock -> widgets. No I/O, so it is testable with `TestBackend`.
 
+use super::input::{Mode, UiState};
+use crate::setting::SettingKind;
 use crate::status::{ChargeState, LedMode, LimitTimer, MAX_PLAUSIBLE_MINUTES, Source, Status};
 use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Sparkline, Wrap};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub const HISTORY_LEN: usize = 120;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_AFTER: Duration = Duration::from_secs(15);
+const TOAST_TTL: Duration = Duration::from_secs(4);
 /// Minimum width for the power-flow and details panels to sit side by side.
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 72;
 const FLOW_HEIGHT: u16 = 13;
@@ -33,10 +36,33 @@ pub enum Conn {
     Fallback(String),
 }
 
+/// Short result message shown in the footer after a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub text: String,
+    pub ok: bool,
+}
+
+impl Toast {
+    pub fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: true,
+        }
+    }
+    pub fn err(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ok: false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Update {
     Conn(Conn),
     Status(Box<Status>),
+    Toast(Toast),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +77,8 @@ pub struct ViewState {
     pub status: Option<Status>,
     pub last_update: Option<Instant>,
     pub history: VecDeque<Sample>,
+    pub ui: UiState,
+    pub toast: Option<(Toast, Instant)>,
     last_sample: Option<Instant>,
 }
 
@@ -61,6 +89,8 @@ impl ViewState {
             status: None,
             last_update: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
+            ui: UiState::default(),
+            toast: None,
             last_sample: None,
         }
     }
@@ -68,6 +98,7 @@ impl ViewState {
     pub fn apply(&mut self, u: Update, now: Instant) {
         match u {
             Update::Conn(c) => self.conn = c,
+            Update::Toast(t) => self.toast = Some((t, now)),
             Update::Status(s) => {
                 if s.source == Source::Gatt
                     && self
@@ -87,6 +118,17 @@ impl ViewState {
                 self.last_update = Some(now);
             }
         }
+    }
+}
+
+impl ViewState {
+    /// True when a live GATT session exists, so settings can be changed.
+    pub fn connected(&self) -> bool {
+        self.conn == Conn::Connected && self.status.as_ref().is_some_and(|s| s.source == Source::Gatt)
+    }
+
+    pub fn set_toast(&mut self, t: Toast, now: Instant) {
+        self.toast = Some((t, now));
     }
 }
 
@@ -261,6 +303,71 @@ pub fn render(f: &mut Frame, v: &ViewState, now: Instant, wall: DateTime<Local>)
         None => render_waiting(f, body, &v.conn, wall),
     }
     render_footer(f, footer, v, now);
+    if v.ui.mode != Mode::Normal {
+        render_settings(f, f.area(), v);
+    }
+}
+
+/// Centered popup listing the changeable settings with their live values.
+fn render_settings(f: &mut Frame, screen: Rect, v: &ViewState) {
+    let width = 46.min(screen.width);
+    let height = 12.min(screen.height);
+    let area = Rect {
+        x: screen.x + (screen.width - width) / 2,
+        y: screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    };
+    let live = v
+        .status
+        .as_ref()
+        .filter(|s| s.source == Source::Gatt && v.conn == Conn::Connected);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Settings ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, kind) in SettingKind::ALL.into_iter().enumerate() {
+        let selected = i == v.ui.selected;
+        let editing =
+            v.ui.edit
+                .as_ref()
+                .filter(|e| e.kind == kind && v.ui.mode == Mode::Editing);
+        let value = match (editing, live) {
+            (Some(e), _) => format!("◂ {}% ▸", e.value),
+            (None, Some(s)) => kind.value_text(s),
+            (None, None) => "n/a".to_string(),
+        };
+        let style = match (live.is_some(), selected) {
+            _ if editing.is_some() => bold().fg(Color::Yellow),
+            (false, _) => dim(),
+            (true, true) => bold().fg(Color::Cyan),
+            (true, false) => Style::default(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if selected { " ▶ " } else { "   " }, style),
+            Span::styled(format!("{:<18}", kind.label()), style),
+            Span::styled(value, style),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    let edit_error = v.ui.edit.as_ref().and_then(|e| e.error.clone());
+    lines.push(match live {
+        Some(_) if edit_error.is_some() => Line::styled(
+            format!(" {}", edit_error.unwrap_or_default()),
+            Style::default().fg(Color::Red),
+        ),
+        Some(_) if v.ui.mode == Mode::Editing => Line::styled(" Enter applies the new limit immediately.", dim()),
+        Some(_) => Line::styled(" Changes apply immediately.", dim()),
+        None => Line::styled(
+            " Not connected: settings cannot be changed.",
+            Style::default().fg(Color::Yellow),
+        ),
+    });
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_header(f: &mut Frame, area: Rect, v: &ViewState, wall: DateTime<Local>) {
@@ -296,6 +403,24 @@ fn render_header(f: &mut Frame, area: Rect, v: &ViewState, wall: DateTime<Local>
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
+fn key_hints(mode: Mode) -> Vec<Span<'static>> {
+    let hints: &[(&str, &str)] = match mode {
+        Mode::Normal => &[("s", " settings  "), ("q", " quit ")],
+        Mode::Settings => &[("↑↓", " select  "), ("Enter", " change  "), ("Esc", " close ")],
+        Mode::Editing => &[
+            ("←→", " adjust  "),
+            ("⇧", " ±5  "),
+            ("0-9", " type  "),
+            ("Enter", " apply  "),
+            ("Esc", " cancel "),
+        ],
+    };
+    hints
+        .iter()
+        .flat_map(|(k, d)| [Span::styled(*k, bold()), Span::styled(*d, dim())])
+        .collect()
+}
+
 fn render_footer(f: &mut Frame, area: Rect, v: &ViewState, now: Instant) {
     let (age_text, stale) = match v.last_update {
         None => ("never".to_string(), false),
@@ -309,15 +434,22 @@ fn render_footer(f: &mut Frame, area: Rect, v: &ViewState, now: Instant) {
     } else {
         dim()
     };
-    let line = justify(
-        vec![
+    let left = match v.toast.as_ref().filter(|(_, at)| now.duration_since(*at) < TOAST_TTL) {
+        Some((t, _)) => {
+            let (mark, color) = if t.ok {
+                ("✔ ", Color::Green)
+            } else {
+                ("✘ ", Color::Red)
+            };
+            vec![Span::styled(format!(" {mark}{}", t.text), bold().fg(color))]
+        }
+        None => vec![
             Span::styled(" updated ", dim()),
             Span::styled(age_text, age_style),
             Span::styled(if stale { "  (stale)" } else { "" }, age_style),
         ],
-        vec![Span::styled("q", bold()), Span::styled(" quit ", dim())],
-        area.width as usize,
-    );
+    };
+    let line = justify(left, key_hints(v.ui.mode), area.width as usize);
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -898,6 +1030,155 @@ mod tests {
         let out = draw_sized(&v, 100, 20);
         assert!(out.contains("Battery data unavailable"), "{out}");
         assert!(out.contains("advertisement only"), "{out}");
+    }
+
+    #[test]
+    fn settings_overlay_shows_live_values() {
+        let mut v = real_device_state();
+        v.ui.mode = Mode::Settings;
+        let out = draw_sized(&v, 110, 32);
+        for want in [
+            "Settings",
+            "charge limit",
+            "85%",
+            "discharge limit",
+            "15%",
+            "light",
+            "12V output",
+            "AC output",
+            "Changes apply immediately",
+            "Enter change",
+            "Esc close",
+        ] {
+            assert!(out.contains(want), "missing {want:?} in:\n{out}");
+        }
+        assert!(out.contains("▶ charge limit"), "{out}");
+        // The dashboard keeps rendering behind the overlay.
+        assert!(out.contains("River 3 Plus") && out.contains("42%"), "{out}");
+        // Normal mode shows no overlay and offers the key to open it.
+        v.ui.mode = Mode::Normal;
+        let out = draw_sized(&v, 110, 32);
+        assert!(
+            !out.contains("Changes apply immediately") && out.contains("settings"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn overlay_selection_marker_follows_the_cursor() {
+        let mut v = real_device_state();
+        v.ui.mode = Mode::Settings;
+        v.ui.selected = 3;
+        let out = draw_sized(&v, 100, 30);
+        assert!(out.contains("▶ 12V output"), "{out}");
+        assert!(!out.contains("▶ charge limit"), "{out}");
+    }
+
+    #[test]
+    fn overlay_is_greyed_out_without_a_live_session() {
+        let mut v = real_device_state();
+        v.ui.mode = Mode::Settings;
+        v.conn = Conn::Reconnecting {
+            reason: "link closed".into(),
+            retry_secs: 2,
+        };
+        let out = draw_sized(&v, 100, 30);
+        assert!(out.contains("Not connected"), "{out}");
+        assert!(!out.contains("85%\n"), "{out}");
+
+        let mut fresh = ViewState::new();
+        fresh.ui.mode = Mode::Settings;
+        assert!(draw_sized(&fresh, 100, 30).contains("Not connected"));
+    }
+
+    fn editing_state(value: u32, error: Option<&str>) -> ViewState {
+        use super::super::input::Edit;
+        let mut v = real_device_state();
+        v.ui.mode = Mode::Editing;
+        v.ui.selected = 1; // discharge limit
+        v.ui.edit = Some(Edit {
+            kind: SettingKind::DischargeLimit,
+            value,
+            typed: String::new(),
+            error: error.map(Into::into),
+        });
+        v
+    }
+
+    #[test]
+    fn editor_shows_the_candidate_value_and_key_hints() {
+        let out = draw_sized(&editing_state(20, None), 110, 32);
+        assert!(out.contains("discharge limit") && out.contains("◂ 20% ▸"), "{out}");
+        assert!(out.contains("Enter applies the new limit"), "{out}");
+        assert!(out.contains("0-9") && out.contains("Esc cancel"), "{out}");
+        // The other rows still show their live values.
+        assert!(out.contains("85%"), "{out}");
+    }
+
+    #[test]
+    fn editor_shows_the_inline_error() {
+        let msg = "discharge limit 90% is above the charge limit (85%); raise the charge limit first";
+        for (w, h) in [(110, 32), (80, 24)] {
+            let out = draw_sized(&editing_state(90, Some(msg)), w, h);
+            // The message wraps inside the popup, so check pieces that stay on one line.
+            assert!(out.contains("is above the charge"), "{w}x{h}: {out}");
+            assert!(out.contains("raise the charge limit first"), "{w}x{h}: {out}");
+        }
+    }
+
+    #[test]
+    fn editor_survives_tiny_terminals() {
+        let v = editing_state(
+            55,
+            Some("some long error message that must wrap or clip without panicking"),
+        );
+        for (w, h) in [(80, 24), (46, 12), (30, 8), (20, 5), (10, 3), (1, 1)] {
+            let _ = draw_sized(&v, w, h);
+        }
+    }
+
+    #[test]
+    fn overlay_survives_tiny_terminals() {
+        let mut v = real_device_state();
+        v.ui.mode = Mode::Settings;
+        for (w, h) in [(80, 24), (60, 12), (46, 11), (30, 8), (20, 5), (10, 3), (1, 1)] {
+            let _ = draw_sized(&v, w, h);
+        }
+        assert!(draw_sized(&v, 80, 24).contains("▶ charge limit"));
+    }
+
+    #[test]
+    fn toast_replaces_the_update_text_and_expires() {
+        let mut v = real_device_state();
+        v.set_toast(Toast::ok("Light set to dim"), Instant::now());
+        let out = draw_sized(&v, 100, 30);
+        assert!(out.contains("✔ Light set to dim") && !out.contains("updated"), "{out}");
+
+        v.set_toast(Toast::err("Not confirmed: light -> dim"), Instant::now());
+        assert!(draw_sized(&v, 100, 30).contains("✘ Not confirmed"));
+
+        v.set_toast(Toast::ok("old"), Instant::now() - Duration::from_secs(10));
+        let out = draw_sized(&v, 100, 30);
+        assert!(!out.contains("old") && out.contains("updated"), "{out}");
+    }
+
+    #[test]
+    fn connected_requires_a_live_gatt_session() {
+        let mut v = real_device_state();
+        assert!(v.connected());
+        v.conn = Conn::Reconnecting {
+            reason: "x".into(),
+            retry_secs: 1,
+        };
+        assert!(!v.connected());
+        let mut adv = ViewState::new();
+        adv.apply(
+            Update::Status(Box::new(Status::from_advertisement(test_device(), "x"))),
+            Instant::now(),
+        );
+        adv.conn = Conn::Connected;
+        assert!(!adv.connected());
+        assert!(!ViewState::new().connected());
     }
 
     #[test]

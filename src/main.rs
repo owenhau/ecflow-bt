@@ -1,59 +1,19 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use ecflow_bt::ble::{self, BleDevice};
+use ecflow_bt::cli::{Cli, Cmd, SetCmd};
 use ecflow_bt::config::{self, Overrides, Settings};
 use ecflow_bt::flow;
-use ecflow_bt::output::{render_json, render_text};
-use ecflow_bt::pb::DisplayPropertyUpload;
+use ecflow_bt::output::{render_json, render_set_json, render_set_text, render_text};
+use ecflow_bt::pb::{CONFIG_WRITE_CMD_ID, CONFIG_WRITE_CMD_SET, ConfigWrite, DisplayPropertyUpload};
 use ecflow_bt::protocol::packet::Packet;
 use ecflow_bt::status::Status;
 use prost::Message;
 use std::process::ExitCode;
 
-/// Exit codes: 0 = live GATT data, 1 = error, 2 = fallback (advertisement data only).
+/// Exit codes: 0 = live GATT data / change applied, 1 = error, 2 = fallback (advertisement data only),
+/// 3 = change sent but not confirmed by the device.
 const EXIT_FALLBACK: u8 = 2;
-
-#[derive(Parser)]
-#[command(
-    version,
-    about = "Read battery and charging status from an EcoFlow River 3 / River 3 Plus over Bluetooth LE"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Cmd>,
-
-    /// EcoFlow account user ID (also EF_USER_ID or `user_id` in config.toml)
-    #[arg(long, global = true)]
-    user_id: Option<String>,
-    /// Device serial number (also EF_SERIAL or `serial`); selects the device and is used if the advertisement lacks it
-    #[arg(long, global = true)]
-    serial: Option<String>,
-    /// Seconds to wait per stage (scan, connect, handshake, first data)
-    #[arg(long, global = true)]
-    timeout: Option<u64>,
-    /// Print JSON instead of text
-    #[arg(long)]
-    json: bool,
-    /// Open the live dashboard
-    #[arg(long)]
-    tui: bool,
-    /// Increase log detail on stderr (-v info, -vv debug, -vvv trace)
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    verbose: u8,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Show the resolved settings (user ID masked) and the config file path
-    Config,
-    /// List supported devices seen over Bluetooth
-    Scan,
-    /// Decode a captured, decrypted inner packet given as hex
-    DecodePacket {
-        /// Hex bytes, e.g. "aa 03 ..." (spaces and colons allowed)
-        hex: String,
-    },
-}
 
 fn settings(cli: &Cli) -> Result<Settings> {
     let file = match config::config_path() {
@@ -130,6 +90,9 @@ fn cmd_decode(hex_str: &str) -> Result<()> {
             encrypt_type: None,
         };
         print!("{}", render_text(&Status::from_props(dummy, &props)));
+    } else if (p.cmd_set, p.cmd_id) == (CONFIG_WRITE_CMD_SET, CONFIG_WRITE_CMD_ID) {
+        let cfg = ConfigWrite::decode(p.payload.as_slice()).context("payload is not a ConfigWrite")?;
+        println!("ConfigWrite: {}", cfg.summary());
     }
     Ok(())
 }
@@ -177,9 +140,34 @@ async fn one_shot(s: &Settings, json: bool) -> Result<ExitCode> {
     }
 }
 
+async fn cmd_set(s: &Settings, what: SetCmd, json: bool) -> Result<ExitCode> {
+    let setting = what.to_setting();
+    // Writes never fall back to advertisement data: without a session there is nothing to change.
+    let dev = ble::find_device(s.timeout, s.serial.as_deref()).await?;
+    let (serial, user_id) = flow::credentials(&dev.info, s).map_err(|reason| anyhow::anyhow!(reason))?;
+    let report = flow::set_with_retries(&dev, &serial, &user_id, s.timeout, setting).await?;
+    for w in &report.warnings {
+        eprintln!("warning: {w}");
+    }
+    if json {
+        println!("{}", render_set_json(&report));
+    } else {
+        print!("{}", render_set_text(&report));
+    }
+    Ok(ExitCode::from(report.exit_code()))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // clap exits with 2 on usage errors, which would clash with our fallback code; use 1 instead.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let code = u8::from(e.use_stderr());
+            let _ = e.print();
+            return ExitCode::from(code);
+        }
+    };
     if !cli.tui {
         init_logging(cli.verbose);
     }
@@ -197,6 +185,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Some(Cmd::DecodePacket { hex }) => cmd_decode(hex)?,
         Some(Cmd::Config) => cmd_config(&settings(&cli)?),
         Some(Cmd::Scan) => cmd_scan(&settings(&cli)?).await?,
+        Some(Cmd::Set { what }) => return cmd_set(&settings(&cli)?, *what, cli.json).await,
         None if cli.tui => ecflow_bt::tui::run(settings(&cli)?).await?,
         None => return one_shot(&settings(&cli)?, cli.json).await,
     }

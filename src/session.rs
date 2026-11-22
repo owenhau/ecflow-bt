@@ -3,11 +3,15 @@
 //! Generic over [`Transport`] so the whole flow runs against a simulated device in tests.
 
 use crate::device::DeviceInfo;
-use crate::pb::{DisplayPropertyUpload, SysUtcSync};
+use crate::pb::{
+    CONFIG_WRITE_CMD_ID, CONFIG_WRITE_CMD_SET, CONFIG_WRITE_DST, CONFIG_WRITE_PACKET_VERSION, CONFIG_WRITE_SRC,
+    ConfigWrite, DisplayPropertyUpload, SysUtcSync,
+};
 use crate::protocol::crypto::{self, SessionCipher};
 use crate::protocol::ecdh::KeyPair;
 use crate::protocol::frame::{FRAME_TYPE_COMMAND, FRAME_TYPE_PROTOCOL, FrameSplitter, RawFrame, encode_frame};
 use crate::protocol::packet::{CMD_CHECK_RET_TIME, CMD_SET_RET_TIME, Packet};
+use crate::setting::Setting;
 use crate::status::Status;
 use prost::Message;
 use std::collections::VecDeque;
@@ -96,6 +100,25 @@ pub trait Transport: Send {
     fn write(&mut self, data: &[u8]) -> impl Future<Output = Result<(), SessionError>> + Send;
     /// Next notification; `Err(LinkClosed)` when the link is gone.
     fn recv(&mut self) -> impl Future<Output = Result<Vec<u8>, SessionError>> + Send;
+}
+
+/// Result of [`Session::apply`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApplyOutcome {
+    /// The device already reported the requested value; nothing was sent.
+    Unchanged(Box<Status>),
+    /// The write was sent and the device reported the new value.
+    Applied(Box<Status>),
+    /// The write was sent but the device did not report the new value in time.
+    Unconfirmed(Box<Status>),
+}
+
+impl ApplyOutcome {
+    pub fn status(&self) -> &Status {
+        match self {
+            Self::Unchanged(s) | Self::Applied(s) | Self::Unconfirmed(s) => s,
+        }
+    }
 }
 
 pub struct Session<T: Transport> {
@@ -319,7 +342,6 @@ impl<T: Transport> Session<T> {
             debug!("throttling repeated time-sync request");
             return Ok(());
         }
-        self.last_time_sync = Some(now);
 
         let secs = chrono::Utc::now().timestamp() as u32;
         let offset = chrono::Local::now().offset().local_minus_utc();
@@ -337,7 +359,50 @@ impl<T: Transport> Session<T> {
         self.send_packet(&Packet::new(0x21, 0x35, 0x01, CMD_SET_RET_TIME, rtc.clone(), 0x03))
             .await?;
         self.send_packet(&Packet::new(0x21, 0x35, 0x01, CMD_CHECK_RET_TIME, rtc, 0x03))
-            .await
+            .await?;
+        // Only now: if this future is dropped mid-way (the TUI worker selects between status
+        // reads and commands), the device simply asks again and the sync is retried.
+        self.last_time_sync = Some(now);
+        Ok(())
+    }
+
+    /// Everything the device has reported so far in this session, merged.
+    pub fn current_status(&self) -> Status {
+        Status::from_props(self.device.clone(), &self.props)
+    }
+
+    /// Send a configuration write. Does not wait for the device to apply it; see [`Self::apply`].
+    pub async fn write(&mut self, cfg: &ConfigWrite) -> Result<(), SessionError> {
+        let pkt = Packet::new(
+            CONFIG_WRITE_SRC,
+            CONFIG_WRITE_DST,
+            CONFIG_WRITE_CMD_SET,
+            CONFIG_WRITE_CMD_ID,
+            cfg.encode_to_vec(),
+            CONFIG_WRITE_PACKET_VERSION,
+        );
+        debug!(change = %cfg.summary(), "sending config write");
+        self.send_packet(&pkt).await
+    }
+
+    /// Write one setting and wait (up to the session timeout) until the device reports the new
+    /// value. Validation against the current state is the caller's job (`Setting::validate`).
+    pub async fn apply(&mut self, setting: Setting) -> Result<ApplyOutcome, SessionError> {
+        let now = self.current_status();
+        if setting.matches(&now) {
+            return Ok(ApplyOutcome::Unchanged(Box::new(now)));
+        }
+        self.write(&setting.to_config()).await?;
+
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.next_status()).await {
+                Ok(Ok(status)) if setting.matches(&status) => return Ok(ApplyOutcome::Applied(Box::new(status))),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(ApplyOutcome::Unconfirmed(Box::new(self.current_status()))),
+            }
+        }
     }
 
     /// Process packets until the next status push; returns the merged status.
@@ -393,7 +458,7 @@ impl<T: Transport> Session<T> {
 mod tests {
     use super::*;
     use crate::status::{ChargeState, Source, test_device};
-    use crate::testutil::{FakeDevice, FakeTransport};
+    use crate::testutil::{FakeDevice, FakeTransport, WriteBehavior};
 
     const SERIAL: &str = "R631TESTSERIAL01";
     const USER: &str = "1234567890";
@@ -503,6 +568,115 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, SessionError::Timeout("key exchange")), "{err:?}");
+    }
+
+    fn base_props() -> DisplayPropertyUpload {
+        DisplayPropertyUpload {
+            cms_batt_soc: Some(64.5),
+            pow_get_bms: Some(-20.0),
+            cms_max_chg_soc: Some(85),
+            cms_min_dsg_soc: Some(15),
+            led_mode: Some(0),
+            flow_info_12v: Some(0),
+            flow_info_ac_out: Some(0),
+            ..Default::default()
+        }
+    }
+
+    async fn connected(
+        behavior: WriteBehavior,
+        timeout: Duration,
+    ) -> (
+        Session<FakeTransport>,
+        std::sync::Arc<std::sync::Mutex<crate::testutil::DeviceLog>>,
+    ) {
+        let device = FakeDevice::new(SERIAL, USER, vec![base_props()]).with_write_behavior(behavior);
+        let (transport, log) = FakeTransport::new(device);
+        let mut s = Session::establish(transport, test_device(), SERIAL, USER, timeout)
+            .await
+            .unwrap();
+        s.read_status(Duration::from_millis(50)).await.unwrap();
+        (s, log)
+    }
+
+    #[tokio::test]
+    async fn every_setting_is_written_and_read_back() {
+        use crate::status::LedMode;
+        let (mut s, log) = connected(WriteBehavior::Apply, T).await;
+        let changes = [
+            Setting::ChargeLimit(90),
+            Setting::DischargeLimit(20),
+            Setting::Light(LedMode::Bright),
+            Setting::Dc12v(true),
+            Setting::AcOutput(true),
+        ];
+        for change in changes {
+            let out = s.apply(change).await.unwrap();
+            assert!(matches!(out, ApplyOutcome::Applied(_)), "{change:?}: {out:?}");
+            assert!(change.matches(out.status()), "{change:?}");
+        }
+        let st = s.current_status();
+        assert_eq!(st.charge_limit_max_percent, Some(90));
+        assert_eq!(st.discharge_limit_min_percent, Some(20));
+        assert_eq!(st.led_mode, Some(LedMode::Bright));
+        assert_eq!((st.dc12v_output_on, st.ac_output_on), (Some(true), Some(true)));
+        // Unrelated fields from the earlier statuses survive the partial updates.
+        assert_eq!(st.battery_percent, Some(64.5));
+
+        let log = log.lock().unwrap();
+        assert_eq!(log.writes.len(), 5);
+        assert_eq!(log.writes[0].cfg_max_chg_soc, Some(90));
+        // Exactly the addressing the reference implementation uses.
+        for a in &log.write_addressing {
+            assert_eq!(*a, (0x20, 0x02, 1, 1, 0x13));
+        }
+    }
+
+    #[tokio::test]
+    async fn turning_things_off_is_written_too() {
+        let (mut s, log) = connected(WriteBehavior::Apply, T).await;
+        s.apply(Setting::Dc12v(true)).await.unwrap();
+        let out = s.apply(Setting::Dc12v(false)).await.unwrap();
+        assert!(matches!(out, ApplyOutcome::Applied(_)));
+        assert_eq!(log.lock().unwrap().writes[1].cfg_dc_12v_out_open, Some(false));
+    }
+
+    #[tokio::test]
+    async fn setting_the_current_value_sends_nothing() {
+        let (mut s, log) = connected(WriteBehavior::Apply, T).await;
+        let out = s.apply(Setting::ChargeLimit(85)).await.unwrap();
+        assert!(matches!(out, ApplyOutcome::Unchanged(_)));
+        assert!(log.lock().unwrap().writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignored_write_is_reported_unconfirmed() {
+        let (mut s, log) = connected(WriteBehavior::IgnoreAndStall, Duration::from_millis(150)).await;
+        let out = s.apply(Setting::DischargeLimit(25)).await.unwrap();
+        match out {
+            ApplyOutcome::Unconfirmed(st) => assert_eq!(st.discharge_limit_min_percent, Some(15)),
+            other => panic!("expected Unconfirmed, got {other:?}"),
+        }
+        assert_eq!(log.lock().unwrap().writes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn link_closing_during_a_write_is_an_error() {
+        let (mut s, _) = connected(WriteBehavior::DropLink, T).await;
+        let err = s.apply(Setting::Dc12v(true)).await.unwrap_err();
+        assert!(matches!(err, SessionError::LinkClosed), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn unrelated_status_pushes_do_not_confirm_a_write() {
+        // The simulated device pushes an unrelated update (cell temperature) before the change.
+        let (mut s, _) = connected(WriteBehavior::Apply, T).await;
+        let out = s.apply(Setting::ChargeLimit(70)).await.unwrap();
+        let ApplyOutcome::Applied(st) = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(st.charge_limit_max_percent, Some(70));
+        assert_eq!(st.cell_temperature_c, Some(33)); // the unrelated push was merged on the way
     }
 
     #[tokio::test]

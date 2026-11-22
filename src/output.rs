@@ -1,5 +1,6 @@
 //! One-shot output: human text and JSON.
 
+use crate::flow::{SetReport, SetResult};
 use crate::status::{Source, Status};
 use std::fmt::Write;
 
@@ -9,6 +10,23 @@ fn opt<T: std::fmt::Display>(v: Option<T>, unit: &str) -> String {
 
 pub fn format_minutes(m: u32) -> String {
     format!("{}h {:02}m", m / 60, m % 60)
+}
+
+/// `charge limit: 85% -> 80% (confirmed)`
+pub fn render_set_text(r: &SetReport) -> String {
+    let label = r.kind.label();
+    match r.result {
+        SetResult::Applied => format!("{label}: {} -> {} (confirmed)\n", r.before, r.after),
+        SetResult::Unchanged => format!("{label}: already {}\n", r.after),
+        SetResult::Unconfirmed => format!(
+            "{label}: requested {} (was {}); sent, but the device did not report the change (still {})\n",
+            r.requested, r.before, r.after
+        ),
+    }
+}
+
+pub fn render_set_json(r: &SetReport) -> String {
+    serde_json::to_string_pretty(r).expect("report serializes")
 }
 
 pub fn render_json(s: &Status) -> String {
@@ -163,6 +181,50 @@ mod tests {
         let t = render_text(&Status::from_props(test_device(), &p));
         assert!(t.contains("To 85% limit: 0h 56m"), "{t}");
         assert!(!t.contains("To 15% limit"), "{t}");
+    }
+
+    fn report(result: SetResult, before: &str, after: &str, requested: &str) -> SetReport {
+        use crate::setting::SettingKind;
+        SetReport {
+            setting: "charge_limit",
+            kind: SettingKind::ChargeLimit,
+            requested: requested.into(),
+            before: before.into(),
+            after: after.into(),
+            result,
+            confirmed: result != SetResult::Unconfirmed,
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn set_text_for_each_result() {
+        let t = render_set_text(&report(SetResult::Applied, "85%", "80%", "80%"));
+        assert_eq!(t, "charge limit: 85% -> 80% (confirmed)\n");
+        let t = render_set_text(&report(SetResult::Unchanged, "85%", "85%", "85%"));
+        assert_eq!(t, "charge limit: already 85%\n");
+        let t = render_set_text(&report(SetResult::Unconfirmed, "85%", "85%", "80%"));
+        assert!(
+            t.contains("requested 80%") && t.contains("did not report the change") && t.contains("still 85%"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn set_json_has_before_after_and_confirmed() {
+        let v: serde_json::Value =
+            serde_json::from_str(&render_set_json(&report(SetResult::Applied, "85%", "80%", "80%"))).unwrap();
+        assert_eq!(v["setting"], "charge_limit");
+        assert_eq!((v["before"].as_str(), v["after"].as_str()), (Some("85%"), Some("80%")));
+        assert_eq!(v["confirmed"], true);
+        assert_eq!(v["result"], "applied");
+        assert!(v["warnings"].as_array().unwrap().is_empty());
+        let u: serde_json::Value =
+            serde_json::from_str(&render_set_json(&report(SetResult::Unconfirmed, "85%", "85%", "80%"))).unwrap();
+        assert_eq!(
+            (u["confirmed"].as_bool(), u["result"].as_str()),
+            (Some(false), Some("unconfirmed"))
+        );
     }
 
     #[test]
