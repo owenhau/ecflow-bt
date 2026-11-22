@@ -1,0 +1,6 @@
+ecflow-bt
+=========
+The EcoFlow BLE protocol implementation (packet framing, handshake, session key
+table in src/protocol/keydata.bin, DisplayPropertyUpload field numbers) is ported
+from the reverse-engineering work in https://github.com/rabits/ha-ef-ble
+(Apache License 2.0). This project is not affiliated with EcoFlow.

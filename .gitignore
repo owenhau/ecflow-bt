@@ -1,0 +1,4 @@
+/target
+# Private captures/fixtures (user IDs, serials). Keep redacted ones in tests/fixtures/.
+/fixtures-private/
+*.private.*
